@@ -1,0 +1,12 @@
+pandas==2.2.2  # 更新到支持 numpy 2.x
+numpy==2.1.0   # 有 wheel 支持
+requests==2.31.0
+websockets==11.0.3
+joblib==1.2.0
+torch==2.3.1
+scikit-learn==1.5.1
+PyWavelets==1.6.0
+pytz==2023.3
+ta-lib==0.4.24  # 新增 for 指标
+pyyaml==6.0.1 # 新增 for 配置
+python-dotenv==1.0.0  # 新增 for env

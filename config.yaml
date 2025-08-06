@@ -1,0 +1,35 @@
+# 新增配置文件：用于统一参数，避免硬编码。
+symbols:
+  - btcusdt
+  - ethusdt
+  - bnbusdt
+  - solusdt
+  - ltcusdt
+  - adausdt
+  - xrpusdt
+  - dogeusdt
+  - linkusdt
+  - avaxusdt
+  - op usdt
+  - arb usdt
+  - w usdt
+  - bchusdt
+  - uniusdt
+  - dotusdt
+  - maticusdt
+  - filusdt
+  - etcusdt
+  - atomusdt
+mode: run  # or train
+symbol: BTCUSDT
+interval: 1m
+lookback_hours: 48
+future_shift: 5
+input_size: 7
+batch_size: 32
+save_interval: 500
+thr_high: 0.6
+thr_low: 0.4
+take_profit: 0.02
+stop_loss: -0.01
+max_concurrent: 50
