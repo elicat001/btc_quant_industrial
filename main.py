@@ -11,7 +11,6 @@ import re
 import math
 import torch
 import numpy as np
-import warnings
 from datetime import datetime, timezone
 from collections import deque
 from logging.handlers import TimedRotatingFileHandler
@@ -47,10 +46,6 @@ def setup_logging():
 setup_logging()
 logger = logging.getLogger("main")
 
-# ===== 屏蔽 numpy 启动早期的统计警告（空/样本极少）=====
-np.seterr(divide="ignore", invalid="ignore")
-warnings.filterwarnings("ignore", message="Degrees of freedom <= 0 for slice")
-warnings.filterwarnings("ignore", message="invalid value encountered in scalar divide")
 
 # ===== 读取配置 =====
 def load_config():
@@ -68,12 +63,9 @@ CONFIG = load_config()
 SYMBOLS = [s.lower() for s in CONFIG.get("symbols", ["btcusdt", "ethusdt"])]
 SEQ_LEN = int(CONFIG.get("seq_len", 30))
 PUSH_ENABLED = bool(CONFIG.get("push_enabled", True))
-MIN_PUSH_INTERVAL = int(CONFIG.get("min_push_interval_sec", 120))  # 默认 120s
+MIN_PUSH_INTERVAL = int(CONFIG.get("min_push_interval_sec", 120))
 LOW_GPU_MODE = bool(CONFIG.get("low_gpu_mode", True))
 INFER_COOLDOWN = float(CONFIG.get("infer_cooldown_sec", 0.0 if not LOW_GPU_MODE else 0.5))
-
-# 是否在推送里展开模型的详细诊断（默认 False：只说“一致/反向”）
-DEBUG_PUSH_MODEL = bool(CONFIG.get("debug_push_model", False))
 
 # 交易相关（给 MM 传费率等）
 TRADING_CFG = CONFIG.get("trading", {}) or {}
@@ -95,18 +87,24 @@ if changed:
 CONFIRM_CFG = CONFIG.get("confirm", {}) or {}
 CONFIRM_NEED_PROB = float(CONFIRM_CFG.get("need_prob", 0.60))
 CONFIRM_MAX_GAP = int(CONFIRM_CFG.get("max_gap_sec", 30))
+CONFIRM_NEED_PROB_LOW_VOL = float(CONFIRM_CFG.get("need_prob_low_vol", CONFIRM_NEED_PROB))
+
+# 门控（方向边际）
+GATE_CFG = CONFIG.get("gate", {}) or {}
+MIN_DIR_MARGIN = float(GATE_CFG.get("min_dir_margin", 0.06))
+MIN_DIR_MARGIN_LOW_VOL = float(GATE_CFG.get("min_dir_margin_low_vol", max(0.10, MIN_DIR_MARGIN)))
 
 # 模拟交易配置
 SIM_CFG = CONFIG.get("sim", {}) or {
     "enable": True,
-    "use_phase_signals": True,     # 使用“阶段性高/低点”开平仓
-    "use_model_decisions": False,  # 如需也基于 BUY/SELL 做模拟 -> True
+    "use_phase_signals": True,
+    "use_model_decisions": False,
     "partials": [0.4, 0.4, 0.2],
     "resend_updates_sec": 60,
     "max_holding_min": 240
 }
 
-pusher = PushManager() if PUSH_ENABLED else None
+pusher = PushManager(CONFIG) if PUSH_ENABLED else None
 
 # ===== 全局缓存（给执行器/模拟器用） =====
 PRICE_CACHE: Dict[str, float] = {}     # symbol -> last trade price (float)
@@ -129,7 +127,151 @@ def _extract_best_from_depth(depth_msg):
 
 
 # =========================
-# 模拟器：PhaseSim（与前版一致）
+# 工具函数：诊断解析与门控
+# =========================
+def safe_fmt(x, nd=2, na="—"):
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return na
+
+
+def _bool_from(diag: str, key: str) -> Optional[bool]:
+    m = re.search(rf"{key}\s*=\s*(True|False)", diag)
+    if not m:
+        return None
+    return True if m.group(1) == "True" else False
+
+
+def parse_diag(diag: str) -> Dict[str, Any]:
+    """
+    从 SignalFusion 的 diag 字符串中提取关键信息（鲁棒解析）
+    """
+    out: Dict[str, Any] = {}
+    if not isinstance(diag, str):
+        return out
+
+    def fnum(pattern, default=None, cast=float):
+        m = re.search(pattern, diag)
+        try:
+            return cast(m.group(1)) if m else default
+        except Exception:
+            return default
+
+    out["p"] = fnum(r"p=([0-9.]+)")
+    out["p_min"] = fnum(r"p_min=([0-9.]+)")
+    out["atr_pct"] = fnum(r"atr%=\s*([0-9.]+)")
+    out["macd"] = fnum(r"macd=\s*([+\-0-9.]+)")
+    out["rsi"] = fnum(r"rsi=\s*([0-9.]+)")
+    out["mm_score"] = fnum(r"mm_score=\s*([0-9.]+)")
+    out["dir_margin"] = fnum(r"dir_margin=\s*([+\-0-9.]+)")
+    out["spread_bp"] = fnum(r"spread_bp=\s*([0-9.]+)")
+    out["imb"] = fnum(r"imb=\s*([+\-0-9.]+)")
+    out["age_ms"] = fnum(r"age_ms=\s*([0-9]+)", cast=int)
+    out["mm_ok"] = _bool_from(diag, "mm_ok")
+    out["force_ok"] = _bool_from(diag, "force_ok")
+    out["low_vol"] = ("low_vol=True" in diag) or ("low_vol<" in diag)
+    m = re.search(r"mm_side\s*=\s*(buy|sell)", diag)
+    out["mm_side"] = m.group(1) if m else None
+    out["mm_block"] = "mm_block" in diag
+    return out
+
+
+def build_env_and_gate(diag: str, cfg: dict) -> Tuple[str, bool]:
+    """
+    返回 (环境摘要, 是否拒绝执行)
+    """
+    info = parse_diag(diag or "")
+    reasons = []
+    reject = False
+
+    low_vol = bool(info.get("low_vol"))
+    mm_score = float(info.get("mm_score") or 0.0)
+    dir_margin = float(info.get("dir_margin") or 0.0)
+    p = float(info.get("p") or 0.0)
+    p_min = float(info.get("p_min") or 1.0)
+
+    # 选择阈值（低波动档优先）
+    score_open = cfg.get("score_open_low_vol", cfg.get("score_open", 0.62)) if low_vol else cfg.get("score_open", 0.62)
+    min_dm = MIN_DIR_MARGIN_LOW_VOL if low_vol else MIN_DIR_MARGIN
+    need_prob = CONFIRM_NEED_PROB_LOW_VOL if low_vol else CONFIRM_NEED_PROB
+
+    # 逐项检查
+    if p < max(p_min, need_prob):
+        reject = True
+        reasons.append("置信不足")
+    if abs(dir_margin) < min_dm:
+        reject = True
+        reasons.append("方向边际不足")
+    if mm_score < score_open:
+        reject = True
+        reasons.append("MM分低")
+    if info.get("mm_block") or (info.get("mm_ok") is False) or (info.get("force_ok") is False):
+        reject = True
+        if "MM阻拦" not in reasons:
+            reasons.append("MM阻拦")
+    if low_vol:
+        if "低波动" not in reasons:
+            reasons.append("低波动")
+
+    env_str = "/".join(reasons) if reasons else "环境:正常"
+    return env_str, reject
+
+
+def execution_gate_state(diag: str, cfg: dict) -> Tuple[bool, List[str], str]:
+    """
+    读取模型诊断行，结合配置返回 (allow: bool, reasons: list[str], view: 'BUY'|'SELL')
+    view 仅是“观点”，不代表可执行。
+    """
+    info = parse_diag(diag or "")
+    p = float(info.get("p") or 0.0)
+    p_min = float(info.get("p_min") or 1.0)
+    mm_score = float(info.get("mm_score") or 0.0)
+    dir_margin = float(info.get("dir_margin") or 0.0)
+    low_vol = bool(info.get("low_vol"))
+
+    # 观点：优先 mm_side，其次 dir_margin 正负，否则根据 p 相对 p_min 粗判
+    if info.get("mm_side") in ("buy", "sell"):
+        view = "BUY" if info["mm_side"] == "buy" else "SELL"
+    elif dir_margin is not None and abs(dir_margin) > 1e-9:
+        view = "BUY" if dir_margin > 0 else "SELL"
+    else:
+        view = "BUY" if p >= p_min else "SELL"
+
+    # 阈值选择
+    score_open = cfg.get("score_open_low_vol", cfg.get("score_open", 0.62)) if low_vol else cfg.get("score_open", 0.62)
+    need_prob = CONFIRM_NEED_PROB_LOW_VOL if low_vol else CONFIRM_NEED_PROB
+    min_dm = MIN_DIR_MARGIN_LOW_VOL if low_vol else MIN_DIR_MARGIN
+
+    reasons = []
+    allow = True
+
+    if p < max(p_min, need_prob):
+        allow = False; reasons.append(f"置信不足(p={p:.3f} < {max(p_min, need_prob):.3f})")
+    if abs(dir_margin) < min_dm:
+        allow = False; reasons.append(f"方向边际不足(|Δp|={abs(dir_margin):.3f} < {min_dm:.3f})")
+    if mm_score < score_open:
+        allow = False; reasons.append(f"MM分不足({mm_score:.3f} < {score_open:.3f})")
+    if low_vol:
+        reasons.append("低波动")
+    if info.get("mm_block") or (info.get("mm_ok") is False) or (info.get("force_ok") is False):
+        allow = False
+        if "MM阻拦" not in reasons:
+            reasons.append("MM阻拦")
+
+    return allow, reasons, view
+
+
+def format_model_confirm(diag: str, cfg: dict) -> str:
+    allow, reasons, view = execution_gate_state(diag, cfg)
+    if not allow:
+        why = "/".join(reasons) if reasons else "过滤"
+        return f"模型观点:{'看多' if view=='BUY' else '看空'}（未执行）\n环境:{why}"
+    return f"模型确认:{'BUY' if view=='BUY' else 'SELL'}（可执行）"
+
+
+# =========================
+# 模拟器：PhaseSim（保持不变）
 # =========================
 class PhaseSim:
     """
@@ -471,7 +613,7 @@ class SymbolRunner:
                             (r1 >= float(ph_cfg.get("min_r1", 1.10))) and \
                             (edge_bp >= float(ph_cfg.get("min_edge_fee_x", 3.0)) * fees_bp)
 
-            header = f"{self.symbol.upper()} | {side_txt} | 置信:{conf:.2f} | 价格:{price:g}"
+            header = f"{side_txt} | 置信:{conf:.2f} | 价格:{price:g}"
             band = (f"波段空间估计：T1={t1:g}({((t1/price-1)*100):+.2f}%) | "
                     f"T2={t2:g}({((t2/price-1)*100):+.2f}%) | "
                     f"T3={t3:g}({((t3/price-1)*100):+.2f}%) | "
@@ -501,61 +643,30 @@ class SymbolRunner:
         except Exception as e:
             self.logger.error(f"[{self.symbol}] _push_phase_event 异常: {e}")
 
-    # === 模型确认信息的统一格式化（只说一致/反向；详细仅在 DEBUG_PUSH_MODEL 时展开）===
-    @staticmethod
-    def _decision_base(decision: str) -> str:
-        # e.g. "BUY@open" -> "BUY"
-        return (decision or "").split("@")[0].upper()
-
-    @staticmethod
-    def _decision_kind(decision: str) -> str:
-        # open / fast_take / trail_take / stop_loss / unknown
-        if "@" in (decision or ""):
-            return decision.split("@", 1)[1]
-        return "unknown"
-
-    def _format_model_confirm(self, fused_signal: Optional[str], decision: str, prob: float, hint: str) -> str:
-        # 一致性判断：
-        # 1) 若是开仓（@open），fused_signal 与 decision 同向 => 一致，否则反向
-        # 2) 若是平仓（fast_take/trail_take/stop_loss），统一标注“反向/仅方向”（模型是趋势方向，不等于平仓方向）
-        d_base = self._decision_base(decision)
-        d_kind = self._decision_kind(decision)
-        fused = (fused_signal or "HOLD").upper()
-
-        # 平仓场景
-        if d_kind in ("fast_take", "trail_take", "stop_loss"):
-            tag = "反向" if fused in ("BUY", "SELL") else "无方向"
-        else:
-            tag = "一致" if fused == d_base else ("反向" if fused in ("BUY", "SELL") else "无方向")
-
-        if not DEBUG_PUSH_MODEL:
-            # 简洁模式：不再输出长串指标
-            return f"模型确认:{fused}{'（' + tag + '）' if tag else ''}"
-        else:
-            # 调试模式：保留 hint 细节
-            return f"模型确认:{fused}{'（' + tag + '，' if tag else '（'}p={prob:.3f} | {hint}）"
-
     async def _swing_loop(self):
         """中期趋势/波段空间评估循环（独立于短线WS）"""
-        if not self.mid.enabled:
+        mt_cfg = CONFIG.get("midtrend", {}) or {}
+        if not mt_cfg.get("enable", True):
             return
-        # 修正：使用 MidTrend.cfg 读取 poll_seconds，避免 AttributeError
-        poll = max(60, int(self.mid.cfg.get("midtrend", {}).get("poll_seconds", 300)))
+        poll = max(60, int(mt_cfg.get("poll_seconds", 300)))
         self.logger.info(f"[{self.symbol}] SWING loop启动，每 {poll}s 评估一次")
         while True:
             try:
                 res = self.mid.analyze(self.symbol)
-                if res and int(res.get("score", 0)) >= int(res.get("score_open", 65)):
-                    bar_time = int(res["bar_time"])
-                    side = res["side"]  # LONG/SHORT
+                if isinstance(res, dict) and int(res.get("score", 0)) >= int(res.get("score_open", mt_cfg.get("score_open", 65))):
+                    bar_time = int(res.get("bar_time", 0))
+                    side = res.get("side", "LONG")  # LONG/SHORT
                     if bar_time != self._last_swing_bar or side != self._last_swing_side:
+                        # 推送
                         symU = self.symbol.upper()
-                        t1 = res["t1"]; t2 = res["t2"]; t3 = res["t3"]; sl = res["sl"]
-                        score = res["score"]; regime = res["regime"]
+                        t1 = res.get("t1"); t2 = res.get("t2"); t3 = res.get("t3"); sl = res.get("sl")
+                        score = res.get("score"); regime = res.get("regime")
+                        adx = res.get("adx"); atrp = res.get("atr_pct"); ema200d = res.get("ema200_d")
+
                         content = (
-                            f"【SWING】{symU} | {side} | 评分 {score}/100 | Regime:{regime}\n"
-                            f"目标：T1={t1:g}  T2={t2:g}  T3={t3:g}  |  SL={sl:g}\n"
-                            f"证据：{res['reason']}"
+                            f"【SWING】{symU} | {side} | 评分 {safe_fmt(score,0)}/100 | Regime:{regime}\n"
+                            f"目标：T1={safe_fmt(t1,0)}  T2={safe_fmt(t2,0)}  T3={safe_fmt(t3,0)}  |  SL={safe_fmt(sl,0)}\n"
+                            f"证据：ADX={safe_fmt(adx,1)}/{mt_cfg.get('adx_thr', 22)} | ATR%={safe_fmt(atrp*100 if atrp is not None else None,2)}% | EMA200Δ={safe_fmt(ema200d*100 if ema200d is not None else None,2)}%"
                         )
                         self.logger.info(content)
                         if pusher:
@@ -567,15 +678,16 @@ class SymbolRunner:
                             except Exception as e:
                                 self.logger.error(f"[{self.symbol}] SWING 推送失败: {e}")
 
-                        # 可选：用PhaseSim开一笔仓位，供纸面交易观察
+                        # 可选：用PhaseSim开“观测仓”
                         if SIM_CFG.get("enable", True) and SIM_CFG.get("use_phase_signals", True):
+                            price_now = float(PRICE_CACHE.get(self.symbol, t1 if side == "LONG" else t3) or 0.0)
                             SIM.open_from_phase(self.symbol, {
                                 "kind": "bottom" if side == "LONG" else "top",
-                                "conf": float(score) / 100.0,
-                                "price": float(PRICE_CACHE.get(self.symbol, t1 if side == "LONG" else t3)),
-                                "t1": float(t1), "t2": float(t2), "t3": float(t3),
-                                "sl": float(sl),
-                                "atr_pct": float(res.get("atr_pct", 0.006)),
+                                "conf": float(score or 0) / 100.0,
+                                "price": price_now,
+                                "t1": float(t1 or price_now), "t2": float(t2 or price_now), "t3": float(t3 or price_now),
+                                "sl": float(sl or price_now),
+                                "atr_pct": float(res.get("atr_pct", 0.006) or 0.006),
                                 "trail_k": CONFIG.get("phase", {}).get("trail_k_atr", 0.6)
                             })
 
@@ -613,12 +725,11 @@ class SymbolRunner:
                 if seq is None or (hasattr(seq, "__len__") and len(seq) == 0):
                     continue
 
-                # 推理速率控制
                 if INFER_COOLDOWN > 0:
-                    now = time.time()
-                    if now - self._last_infer_ts < INFER_COOLDOWN:
+                    now_cool = time.time()
+                    if now_cool - self._last_infer_ts < INFER_COOLDOWN:
                         continue
-                    self._last_infer_ts = now
+                    self._last_infer_ts = now_cool
 
                 label, prob = self.mm.predict(seq)
                 self.logger.info(f"[{self.symbol}] prob={prob:.3f} label={label}")
@@ -643,35 +754,35 @@ class SymbolRunner:
                 )
                 self.logger.info(f"[{self.symbol}] fused_signal={fused_signal} | {diag}")
 
+                # 阶段性事件推送 & 模拟
                 if isinstance(phase_evt, dict):
                     self._push_phase_event(phase_evt)
 
-                # 可选：用模型方向做模拟仓位
-                if SIM_CFG.get("enable", True) and SIM_CFG.get("use_model_decisions", False):
-                    try:
-                        if fused_signal in ("BUY", "SELL") and price is not None:
-                            atr_pct = max(1e-6, float(vol_abs) if 0 < vol_abs < 0.2 else 0.006)
-                            px = float(price)
-                            up = 1 + atr_pct * 1.5
-                            up2 = 1 + atr_pct * 2.5
-                            up3 = 1 + atr_pct * 4.0
-                            dn = 1 - atr_pct * 1.0
-                            if fused_signal == "BUY":
-                                phase_like = {"kind": "bottom", "conf": float(prob), "price": px,
-                                              "t1": px * up, "t2": px * up2, "t3": px * up3, "sl": px * dn,
-                                              "atr_pct": atr_pct, "trail_k": CONFIG.get("phase", {}).get("trail_k_atr", 0.6)}
-                            else:
-                                phase_like = {"kind": "top", "conf": float(prob), "price": px,
-                                              "t1": px / up, "t2": px / up2, "t3": px / up3, "sl": px / dn,
-                                              "atr_pct": atr_pct, "trail_k": CONFIG.get("phase", {}).get("trail_k_atr", 0.6)}
-                            SIM.open_from_phase(self.symbol, phase_like)
-                    except Exception as e:
-                        self.logger.error(f"[{self.symbol}] 模型模拟开仓异常: {e}")
+                # 统一门控：先看是否允许执行（观点与执行分离）
+                mm_cfg = CONFIG.get("mm", {}) or {}
+                env_str, gate_reject = build_env_and_gate(diag or "", mm_cfg)
+                model_line = format_model_confirm(diag or "", {
+                    "score_open": mm_cfg.get("score_open", 0.62),
+                    "score_force": mm_cfg.get("score_force", 0.52),
+                    "score_open_low_vol": mm_cfg.get("score_open_low_vol", mm_cfg.get("score_open", 0.62)),
+                    "score_force_low_vol": mm_cfg.get("score_force_low_vol", mm_cfg.get("score_force", 0.52)),
+                })
 
-                # 双确认
-                if not self._confirm_signal(fused_signal, prob, CONFIRM_MAX_GAP, CONFIRM_NEED_PROB):
+                # 如果门控拒绝，直接降级为 HOLD@filtered（不再误导）
+                if gate_reject:
+                    if prob is None:
+                        continue
+                    await self._maybe_push("HOLD@filtered", {
+                        "p": float(price) if price is not None else None
+                    }, prob, fused_signal=fused_signal, reason="filtered", env_str=env_str, model_line=model_line)
                     continue
 
+                # 双确认
+                if not self._confirm_signal(fused_signal, prob, CONFIRM_MAX_GAP,
+                                            CONFIRM_NEED_PROB_LOW_VOL if "低波动" in env_str else CONFIRM_NEED_PROB):
+                    continue
+
+                # 进入风控裁决
                 trade_for_risk = {
                     "symbol": self.symbol,
                     "p": float(price) if price is not None else None,
@@ -679,16 +790,18 @@ class SymbolRunner:
                     "p_hat_prob": float(prob),
                     "p_min": getattr(self.sf, "p_min", 0.0)
                 }
-
                 decision, reason = self.risk.judge(fused_signal, trade_for_risk)
                 self.logger.info(f"[{self.symbol}] decision={decision} reason={reason}")
-                if decision not in ("BUY", "SELL", "BUY@open", "SELL@open",
-                                    "SELL@fast_take", "BUY@fast_take",
-                                    "SELL@trail_take", "BUY@trail_take",
-                                    "SELL@stop_loss", "BUY@stop_loss"):
+                if decision not in ("BUY", "SELL"):
+                    # 非买卖也给出“模型观点 + 环境”但不强推
+                    await self._maybe_push(f"HOLD@{reason or 'no_change'}", trade_for_risk, prob,
+                                           fused_signal=fused_signal, reason=reason, env_str=env_str, model_line=model_line)
                     continue
 
-                await self._maybe_push(decision, trade_for_risk, prob, hint=diag, fused_signal=fused_signal, reason=reason)
+                # 推送 + 执行
+                await self._maybe_push(decision, trade_for_risk, prob,
+                                       hint=diag, fused_signal=fused_signal, reason=reason,
+                                       env_str=env_str, model_line=model_line)
 
                 if self.executor:
                     exec_resp = self.executor.execute(self.symbol, decision, reason)
@@ -702,7 +815,9 @@ class SymbolRunner:
             traceback.print_exc()
             await asyncio.sleep(0.1)
 
-    async def _maybe_push(self, decision, trade_msg, prob, hint="", fused_signal=None, reason=""):
+    async def _maybe_push(self, decision, trade_msg, prob,
+                          hint="", fused_signal=None, reason="",
+                          env_str: str = "", model_line: str = ""):
         now = time.time()
         if now - self._last_push_ts < MIN_PUSH_INTERVAL:
             return
@@ -710,14 +825,28 @@ class SymbolRunner:
         price = trade_msg.get("p") or trade_msg.get("price")
         symU = self.symbol.upper()
 
-        # 统一的“模型确认”文案（默认不展开一堆指标）
-        model_line = self._format_model_confirm(fused_signal, decision, prob, hint)
-
-        content = (
-            f"{symU}\n"
-            f"决策:{decision} 价格:{price} 置信:{prob:.2f}\n"
-            f"{model_line}"
-        )
+        # 统一文案
+        if decision.startswith("HOLD@"):
+            content = (
+                f"{symU}\n"
+                f"决策:{decision} 价格:{safe_fmt(price, 2)} 置信:{prob:.2f}\n"
+                f"{model_line}\n"
+                f"环境: {env_str}"
+            )
+        elif decision in ("BUY", "SELL"):
+            content = (
+                f"{symU}\n"
+                f"决策:{decision}{('@' + reason) if reason else ''} 价格:{safe_fmt(price, 2)} 置信:{prob:.2f}\n"
+                f"{model_line}\n"
+                f"环境: {env_str}"
+            )
+        else:
+            content = (
+                f"{symU}\n"
+                f"决策:{decision}{('@' + reason) if reason else ''} 价格:{safe_fmt(price, 2)} 置信:{prob:.2f}\n"
+                f"{model_line}\n"
+                f"环境: {env_str}"
+            )
 
         key = f"{self.symbol}|{decision}|{round(float(price or 0),2)}|{int(prob*100)}|{reason}|{fused_signal}"
         last_ts = self._push_seen.get(key, 0.0)
@@ -725,6 +854,7 @@ class SymbolRunner:
             self.logger.debug(f"[{self.symbol}] 推送去重拦截: {key}")
             return
         self._push_seen[key] = now
+
         self._last_push_ts = now
 
         self.logger.info(content)
